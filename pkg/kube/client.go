@@ -67,8 +67,11 @@ type Client struct {
 	Log     func(string, ...interface{})
 	// Namespace allows to bypass the kubeconfig file for the choice of the namespace
 	Namespace string
+	// ServerDryRun controls whether to set server dry run on manipulating resources
+	ServerDryRun bool
 
-	kubeClient *kubernetes.Clientset
+	kubeClient     *kubernetes.Clientset
+	dryRunVerifier *resource.DryRunVerifier
 }
 
 var addToScheme sync.Once
@@ -106,6 +109,19 @@ func (c *Client) getKubeClient() (*kubernetes.Clientset, error) {
 	return c.kubeClient, err
 }
 
+// getDryRunVerifier get or create a new DryRunVerifier
+func (c *Client) getDryRunVerifier() (*resource.DryRunVerifier, error) {
+	if c.dryRunVerifier != nil {
+		return c.dryRunVerifier, nil
+	}
+	dynCli, err := c.Factory.DynamicClient()
+	if err != nil {
+		return nil, err
+	}
+	c.dryRunVerifier = resource.NewDryRunVerifier(dynCli, c.Factory.OpenAPIGetter())
+	return c.dryRunVerifier, nil
+}
+
 // IsReachable tests connectivity to the cluster.
 func (c *Client) IsReachable() error {
 	client, err := c.getKubeClient()
@@ -125,8 +141,21 @@ func (c *Client) IsReachable() error {
 
 // Create creates Kubernetes resources specified in the resource list.
 func (c *Client) Create(resources ResourceList) (*Result, error) {
+	dryRunVerifier, err := c.getDryRunVerifier()
+	if err != nil && c.ServerDryRun {
+		return nil, err
+	}
+
 	c.Log("creating %d resource(s)", len(resources))
-	if err := perform(resources, createResource); err != nil {
+	if err := perform(resources, func(info *resource.Info) error {
+		if c.ServerDryRun {
+			if err := dryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
+				return errors.Wrap(err, "the resource doesn't have dry run support or error occurred")
+			}
+		}
+
+		return createResource(info, c.ServerDryRun)
+	}); err != nil {
 		return nil, err
 	}
 	return &Result{Created: resources}, nil
@@ -203,17 +232,31 @@ func (c *Client) Build(reader io.Reader, validate bool) (ResourceList, error) {
 // resource updates, creations, and deletions that were attempted. These can be
 // used for cleanup or other logging purposes.
 func (c *Client) Update(original, target ResourceList, force bool) (*Result, error) {
+	dryRunVerifier, err := c.getDryRunVerifier()
+	if err != nil && c.ServerDryRun {
+		return nil, err
+	}
+
 	updateErrors := []string{}
-	res := &Result{}
+	res := &Result{
+		LiveBeforeUpdate: make(map[*resource.Info]runtime.Object),
+	}
 
 	c.Log("checking %d resources for changes", len(target))
-	err := target.Visit(func(info *resource.Info, err error) error {
+	err = target.Visit(func(info *resource.Info, err error) error {
 		if err != nil {
 			return err
 		}
 
-		helper := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager())
-		if _, err := helper.Get(info.Namespace, info.Name); err != nil {
+		if c.ServerDryRun {
+			if err := dryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
+				return errors.Wrap(err, "the resource doesn't have dry run support or error occurred")
+			}
+		}
+
+		helper := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager()).DryRun(c.ServerDryRun)
+		liveObj, err := helper.Get(info.Namespace, info.Name)
+		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				return errors.Wrap(err, "could not get information about the resource")
 			}
@@ -222,7 +265,7 @@ func (c *Client) Update(original, target ResourceList, force bool) (*Result, err
 			res.Created = append(res.Created, info)
 
 			// Since the resource does not exist, create it.
-			if err := createResource(info); err != nil {
+			if err := createResource(info, c.ServerDryRun); err != nil {
 				return errors.Wrap(err, "failed to create resource")
 			}
 
@@ -231,13 +274,16 @@ func (c *Client) Update(original, target ResourceList, force bool) (*Result, err
 			return nil
 		}
 
+		// Put the current live state to the results
+		res.LiveBeforeUpdate[info] = liveObj
+
 		originalInfo := original.Get(info)
 		if originalInfo == nil {
 			kind := info.Mapping.GroupVersionKind.Kind
 			return errors.Errorf("no %s with the name %q found", kind, info.Name)
 		}
 
-		if err := updateResource(c, info, originalInfo.Object, force); err != nil {
+		if err := updateResource(c, info, originalInfo.Object, force, c.ServerDryRun); err != nil {
 			c.Log("error updating the resource %q:\n\t %v", info.Name, err)
 			updateErrors = append(updateErrors, err.Error())
 		}
@@ -255,6 +301,12 @@ func (c *Client) Update(original, target ResourceList, force bool) (*Result, err
 	}
 
 	for _, info := range original.Difference(target) {
+		if c.ServerDryRun {
+			if err := dryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
+				return res, errors.Wrap(err, "the resource doesn't have dry run support or error occurred")
+			}
+		}
+
 		c.Log("Deleting %q in %s...", info.Name, info.Namespace)
 
 		if err := info.Get(); err != nil {
@@ -269,7 +321,7 @@ func (c *Client) Update(original, target ResourceList, force bool) (*Result, err
 			c.Log("Skipping delete of %q due to annotation [%s=%s]", info.Name, ResourcePolicyAnno, KeepPolicy)
 			continue
 		}
-		if err := deleteResource(info); err != nil {
+		if err := deleteResource(info, c.ServerDryRun); err != nil {
 			c.Log("Failed to delete %q, err: %s", info.ObjectName(), err)
 			continue
 		}
@@ -283,12 +335,23 @@ func (c *Client) Update(original, target ResourceList, force bool) (*Result, err
 // errors. All successfully deleted items will be returned in the `Deleted`
 // ResourceList that is part of the result.
 func (c *Client) Delete(resources ResourceList) (*Result, []error) {
+	dryRunVerifier, err := c.getDryRunVerifier()
+	if err != nil && c.ServerDryRun {
+		return nil, []error{err}
+	}
+
 	var errs []error
 	res := &Result{}
 	mtx := sync.Mutex{}
-	err := perform(resources, func(info *resource.Info) error {
+	err = perform(resources, func(info *resource.Info) error {
+		if c.ServerDryRun {
+			if err := dryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
+				return errors.Wrap(err, "the resource doesn't have dry run support or error occurred")
+			}
+		}
+
 		c.Log("Starting delete for %q %s", info.Name, info.Mapping.GroupVersionKind.Kind)
-		if err := c.skipIfNotFound(deleteResource(info)); err != nil {
+		if err := c.skipIfNotFound(deleteResource(info, c.ServerDryRun)); err != nil {
 			mtx.Lock()
 			defer mtx.Unlock()
 			// Collect the error and continue on
@@ -309,7 +372,8 @@ func (c *Client) Delete(resources ResourceList) (*Result, []error) {
 		errs = append(errs, err)
 	}
 	if errs != nil {
-		return nil, errs
+		// return result even if some errors occurred
+		return res, errs
 	}
 	return res, nil
 }
@@ -346,6 +410,12 @@ func (c *Client) WatchUntilReady(resources ResourceList, timeout time.Duration) 
 	// For jobs, there's also the option to do poll c.Jobs(namespace).Get():
 	// https://github.com/adamreese/kubernetes/blob/master/test/e2e/job.go#L291-L300
 	return perform(resources, c.watchTimeout(timeout))
+}
+
+func (c *Client) WithServerDryRun() Interface {
+	newClient := *c
+	newClient.ServerDryRun = true
+	return &newClient
 }
 
 func perform(infos ResourceList, fn func(*resource.Info) error) error {
@@ -402,22 +472,22 @@ func batchPerform(infos ResourceList, fn func(*resource.Info) error, errs chan<-
 	}
 }
 
-func createResource(info *resource.Info) error {
-	obj, err := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager()).Create(info.Namespace, true, info.Object)
+func createResource(info *resource.Info, dryRun bool) error {
+	obj, err := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager()).DryRun(dryRun).Create(info.Namespace, true, info.Object)
 	if err != nil {
 		return err
 	}
 	return info.Refresh(obj, true)
 }
 
-func deleteResource(info *resource.Info) error {
+func deleteResource(info *resource.Info, dryRun bool) error {
 	policy := metav1.DeletePropagationBackground
 	opts := &metav1.DeleteOptions{PropagationPolicy: &policy}
-	_, err := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager()).DeleteWithOptions(info.Namespace, info.Name, opts)
+	_, err := resource.NewHelper(info.Client, info.Mapping).WithFieldManager(getManagedFieldsManager()).DryRun(dryRun).DeleteWithOptions(info.Namespace, info.Name, opts)
 	return err
 }
 
-func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.PatchType, error) {
+func createPatch(target *resource.Info, current runtime.Object, dryRun bool) ([]byte, types.PatchType, error) {
 	oldData, err := json.Marshal(current)
 	if err != nil {
 		return nil, types.StrategicMergePatchType, errors.Wrap(err, "serializing current configuration")
@@ -428,7 +498,7 @@ func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.P
 	}
 
 	// Fetch the current object for the three way merge
-	helper := resource.NewHelper(target.Client, target.Mapping).WithFieldManager(getManagedFieldsManager())
+	helper := resource.NewHelper(target.Client, target.Mapping).WithFieldManager(getManagedFieldsManager()).DryRun(dryRun)
 	currentObj, err := helper.Get(target.Namespace, target.Name)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, types.StrategicMergePatchType, errors.Wrapf(err, "unable to get data for current object %s/%s", target.Namespace, target.Name)
@@ -467,10 +537,10 @@ func createPatch(target *resource.Info, current runtime.Object) ([]byte, types.P
 	return patch, types.StrategicMergePatchType, err
 }
 
-func updateResource(c *Client, target *resource.Info, currentObj runtime.Object, force bool) error {
+func updateResource(c *Client, target *resource.Info, currentObj runtime.Object, force bool, dryRun bool) error {
 	var (
 		obj    runtime.Object
-		helper = resource.NewHelper(target.Client, target.Mapping).WithFieldManager(getManagedFieldsManager())
+		helper = resource.NewHelper(target.Client, target.Mapping).WithFieldManager(getManagedFieldsManager()).DryRun(dryRun)
 		kind   = target.Mapping.GroupVersionKind.Kind
 	)
 
@@ -483,7 +553,7 @@ func updateResource(c *Client, target *resource.Info, currentObj runtime.Object,
 		}
 		c.Log("Replaced %q with kind %s for kind %s", target.Name, currentObj.GetObjectKind().GroupVersionKind().Kind, kind)
 	} else {
-		patch, patchType, err := createPatch(target, currentObj)
+		patch, patchType, err := createPatch(target, currentObj, dryRun)
 		if err != nil {
 			return errors.Wrap(err, "failed to create patch")
 		}

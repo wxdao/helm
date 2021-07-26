@@ -70,4 +70,12 @@ type Interface interface {
 	IsReachable() error
 }
 
-var _ Interface = (*Client)(nil)
+// ServerDryRunnableInterface represents a client that supports server dry run along with Interface.
+type ServerDryRunnableInterface interface {
+	Interface
+
+	// WithServerDryRun returns a copy of the Interface that runs every action with server dry run.
+	WithServerDryRun() Interface
+}
+
+var _ ServerDryRunnableInterface = (*Client)(nil)

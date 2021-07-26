@@ -22,6 +22,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/resource"
 
 	"helm.sh/helm/v3/pkg/kube"
@@ -30,7 +31,8 @@ import (
 // PrintingKubeClient implements KubeClient, but simply prints the reader to
 // the given output.
 type PrintingKubeClient struct {
-	Out io.Writer
+	Out    io.Writer
+	DryRun bool
 }
 
 // IsReachable checks if the cluster is reachable
@@ -83,7 +85,11 @@ func (p *PrintingKubeClient) Update(_, modified kube.ResourceList, _ bool) (*kub
 	// TODO: This doesn't completely mock out have some that get created,
 	// updated, and deleted. I don't think these are used in any unit tests, but
 	// we may want to refactor a way to handle future tests
-	return &kube.Result{Updated: modified}, nil
+	liveMap := map[*resource.Info]runtime.Object{}
+	for _, info := range modified {
+		liveMap[info] = info.Object
+	}
+	return &kube.Result{Updated: modified, LiveBeforeUpdate: liveMap}, nil
 }
 
 // Build implements KubeClient Build.
@@ -94,6 +100,11 @@ func (p *PrintingKubeClient) Build(_ io.Reader, _ bool) (kube.ResourceList, erro
 // WaitAndGetCompletedPodPhase implements KubeClient WaitAndGetCompletedPodPhase.
 func (p *PrintingKubeClient) WaitAndGetCompletedPodPhase(_ string, _ time.Duration) (v1.PodPhase, error) {
 	return v1.PodSucceeded, nil
+}
+
+// WithServerDryRun implements KubeClient WithServerDryRun.
+func (p *PrintingKubeClient) WithServerDryRun() kube.Interface {
+	return &PrintingKubeClient{Out: p.Out, DryRun: true}
 }
 
 func bufferize(resources kube.ResourceList) io.Reader {

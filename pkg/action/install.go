@@ -33,6 +33,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/resource"
 	"sigs.k8s.io/yaml"
 
@@ -104,6 +105,9 @@ type Install struct {
 	// OutputDir/<ReleaseName>
 	UseReleaseName bool
 	PostRenderer   postrender.PostRenderer
+	// ServerDryRun specifies whether to make use of apiserver dry-run for kube api.
+	// If `true`, the upgrade is performed with apiserver dry-run enabled, without changing stored release meta.
+	ServerDryRun bool
 }
 
 // ChartPathOptions captures common options used for controlling chart paths
@@ -128,62 +132,86 @@ func NewInstall(cfg *Configuration) *Install {
 	}
 }
 
-func (i *Install) installCRDs(crds []chart.CRD) error {
+func (i *Install) installCRDs(crds []chart.CRD) (*kube.Result, error) {
 	// We do these one file at a time in the order they were read.
 	totalItems := []*resource.Info{}
+	results := &kube.Result{}
 	for _, obj := range crds {
 		// Read in the resources
 		res, err := i.cfg.KubeClient.Build(bytes.NewBuffer(obj.File.Data), false)
 		if err != nil {
-			return errors.Wrapf(err, "failed to install CRD %s", obj.Name)
+			return nil, errors.Wrapf(err, "failed to install CRD %s", obj.Name)
 		}
 
 		// Send them to Kube
-		if _, err := i.cfg.KubeClient.Create(res); err != nil {
+		result, err := i.cfg.KubeClient.Create(res)
+		if err != nil {
 			// If the error is CRD already exists, continue.
 			if apierrors.IsAlreadyExists(err) {
 				crdName := res[0].Name
 				i.cfg.Log("CRD %s is already present. Skipping.", crdName)
 				continue
 			}
-			return errors.Wrapf(err, "failed to install CRD %s", obj.Name)
+			return nil, errors.Wrapf(err, "failed to install CRD %s", obj.Name)
 		}
 		totalItems = append(totalItems, res...)
+		// merge created resource infos
+		results.Created = append(results.Created, result.Created...)
 	}
-	if len(totalItems) > 0 {
+	if len(totalItems) > 0 && !i.ServerDryRun {
 		// Invalidate the local cache, since it will not have the new CRDs
 		// present.
 		discoveryClient, err := i.cfg.RESTClientGetter.ToDiscoveryClient()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		i.cfg.Log("Clearing discovery cache")
 		discoveryClient.Invalidate()
 		// Give time for the CRD to be recognized.
 
 		if err := i.cfg.KubeClient.Wait(totalItems, 60*time.Second); err != nil {
-			return err
+			return nil, err
 		}
 
 		// Make sure to force a rebuild of the cache.
 		discoveryClient.ServerGroups()
 	}
-	return nil
+	return results, nil
 }
 
 // Run executes the installation
 //
 // If DryRun is set to true, this will prepare the release, but not install it
 func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.Release, error) {
+	rel, _, err := i.RunWithResult(chrt, vals)
+	return rel, err
+}
+
+// RunWithResult executes the installation returning kube.Result as well
+//
+// If DryRun is set to true, this will prepare the release, but not install it
+func (i *Install) RunWithResult(chrt *chart.Chart, vals map[string]interface{}) (*release.Release, *kube.Result, error) {
+	if i.ServerDryRun {
+		dri, ok := i.cfg.KubeClient.(kube.ServerDryRunnableInterface)
+		if !ok {
+			return nil, nil, errors.New("the kube client doesn't support server dry run")
+		}
+		i.cfg.KubeClient = dri.WithServerDryRun()
+	}
+
 	// Check reachability of cluster unless in client-only mode (e.g. `helm template` without `--validate`)
 	if !i.ClientOnly {
 		if err := i.cfg.KubeClient.IsReachable(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if err := i.availableName(); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	kubeResult := &kube.Result{
+		LiveBeforeUpdate: make(map[*resource.Info]runtime.Object),
 	}
 
 	// Pre-install anything in the crd/ directory. We do this before Helm
@@ -192,8 +220,11 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 		// On dry run, bail here
 		if i.DryRun {
 			i.cfg.Log("WARNING: This chart or one of its subcharts contains CRDs. Rendering may fail or contain inaccuracies.")
-		} else if err := i.installCRDs(crds); err != nil {
-			return nil, err
+		}
+		result, err := i.installCRDs(crds)
+		kubeResult.Created = append(kubeResult.Created, result.Created...)
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -215,7 +246,7 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 	}
 
 	if err := chartutil.ProcessDependencies(chrt, vals); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Make sure if Atomic is set, that wait is set as well. This makes it so
@@ -224,7 +255,7 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 
 	caps, err := i.cfg.getCapabilities()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// special case for helm template --is-upgrade
@@ -238,7 +269,7 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 	}
 	valuesToRender, err := chartutil.ToRenderValues(chrt, vals, options, caps)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	rel := i.createRelease(chrt, vals)
@@ -253,7 +284,7 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 	if err != nil {
 		rel.SetStatus(release.StatusFailed, fmt.Sprintf("failed to render resource: %s", err.Error()))
 		// Return a release with partial data so that the client can show debugging information.
-		return rel, err
+		return rel, nil, err
 	}
 
 	// Mark this release as in-progress
@@ -262,13 +293,13 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 	var toBeAdopted kube.ResourceList
 	resources, err := i.cfg.KubeClient.Build(bytes.NewBufferString(rel.Manifest), !i.DisableOpenAPIValidation)
 	if err != nil {
-		return nil, errors.Wrap(err, "unable to build kubernetes objects from release manifest")
+		return nil, nil, errors.Wrap(err, "unable to build kubernetes objects from release manifest")
 	}
 
 	// It is safe to use "force" here because these are resources currently rendered by the chart.
 	err = resources.Visit(setMetadataVisitor(rel.Name, rel.Namespace, true))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Install requires an extra validation step of checking that resources
@@ -280,14 +311,14 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 	if !i.ClientOnly && !isUpgrade && len(resources) > 0 {
 		toBeAdopted, err = existingResourceConflict(resources, rel.Name, rel.Namespace)
 		if err != nil {
-			return nil, errors.Wrap(err, "rendered manifests contain a resource that already exists. Unable to continue with install")
+			return nil, nil, errors.Wrap(err, "rendered manifests contain a resource that already exists. Unable to continue with install")
 		}
 	}
 
 	// Bail out here if it is a dry run
 	if i.DryRun {
 		rel.Info.Description = "Dry run complete"
-		return rel, nil
+		return rel, nil, nil
 	}
 
 	if i.CreateNamespace {
@@ -305,37 +336,42 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 		}
 		buf, err := yaml.Marshal(ns)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		resourceList, err := i.cfg.KubeClient.Build(bytes.NewBuffer(buf), true)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if _, err := i.cfg.KubeClient.Create(resourceList); err != nil && !apierrors.IsAlreadyExists(err) {
-			return nil, err
+		result, err := i.cfg.KubeClient.Create(resourceList)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return nil, nil, err
 		}
+		kubeResult.Created = append(kubeResult.Created, result.Created...)
 	}
 
-	// If Replace is true, we need to supercede the last release.
-	if i.Replace {
-		if err := i.replaceRelease(rel); err != nil {
-			return nil, err
+	if !i.ServerDryRun {
+		// If Replace is true, we need to supercede the last release.
+		if i.Replace {
+			if err := i.replaceRelease(rel); err != nil {
+				return nil, nil, err
+			}
 		}
-	}
 
-	// Store the release in history before continuing (new in Helm 3). We always know
-	// that this is a create operation.
-	if err := i.cfg.Releases.Create(rel); err != nil {
-		// We could try to recover gracefully here, but since nothing has been installed
-		// yet, this is probably safer than trying to continue when we know storage is
-		// not working.
-		return rel, err
-	}
+		// Store the release in history before continuing (new in Helm 3). We always know
+		// that this is a create operation.
+		if err := i.cfg.Releases.Create(rel); err != nil {
+			// We could try to recover gracefully here, but since nothing has been installed
+			// yet, this is probably safer than trying to continue when we know storage is
+			// not working.
+			return rel, nil, err
+		}
 
-	// pre-install hooks
-	if !i.DisableHooks {
-		if err := i.cfg.execHook(rel, release.HookPreInstall, i.Timeout); err != nil {
-			return i.failRelease(rel, fmt.Errorf("failed pre-install: %s", err))
+		// pre-install hooks
+		if !i.DisableHooks {
+			if err := i.cfg.execHook(rel, release.HookPreInstall, i.Timeout); err != nil {
+				rel, err := i.failRelease(rel, fmt.Errorf("failed pre-install: %s", err))
+				return rel, nil, err
+			}
 		}
 	}
 
@@ -343,30 +379,61 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 	// do an update, but it's not clear whether we WANT to do an update if the re-use is set
 	// to true, since that is basically an upgrade operation.
 	if len(toBeAdopted) == 0 && len(resources) > 0 {
-		if _, err := i.cfg.KubeClient.Create(resources); err != nil {
-			return i.failRelease(rel, err)
+		result, err := i.cfg.KubeClient.Create(resources)
+		if err != nil {
+			if i.ServerDryRun {
+				rel.SetStatus(release.StatusFailed, fmt.Sprintf("Release %q failed with server dry run: %s", rel.Name, err))
+				return rel, nil, err
+			}
+			rel, err := i.failRelease(rel, err)
+			return rel, nil, err
 		}
+		kubeResult.Created = append(kubeResult.Created, result.Created...)
 	} else if len(resources) > 0 {
-		if _, err := i.cfg.KubeClient.Update(toBeAdopted, resources, false); err != nil {
-			return i.failRelease(rel, err)
+		result, err := i.cfg.KubeClient.Update(toBeAdopted, resources, false)
+		if err != nil {
+			if i.ServerDryRun {
+				rel.SetStatus(release.StatusFailed, fmt.Sprintf("Release %q failed with server dry run: %s", rel.Name, err))
+				return rel, nil, err
+			}
+			rel, err := i.failRelease(rel, err)
+			return rel, nil, err
 		}
+		kubeResult.Created = append(kubeResult.Created, result.Created...)
+		kubeResult.Updated = append(kubeResult.Created, result.Updated...)
+		for k, v := range result.LiveBeforeUpdate {
+			kubeResult.LiveBeforeUpdate[k] = v
+		}
+		kubeResult.Deleted = append(kubeResult.Deleted, result.Deleted...)
+	}
+	// skip further processing if this is a server dry run
+	if i.ServerDryRun {
+		if len(i.Description) > 0 {
+			rel.SetStatus(release.StatusDeployed, i.Description)
+		} else {
+			rel.SetStatus(release.StatusDeployed, "Server dry run complete")
+		}
+		return rel, kubeResult, nil
 	}
 
 	if i.Wait {
 		if i.WaitForJobs {
 			if err := i.cfg.KubeClient.WaitWithJobs(resources, i.Timeout); err != nil {
-				return i.failRelease(rel, err)
+				rel, err := i.failRelease(rel, err)
+				return rel, nil, err
 			}
 		} else {
 			if err := i.cfg.KubeClient.Wait(resources, i.Timeout); err != nil {
-				return i.failRelease(rel, err)
+				rel, err := i.failRelease(rel, err)
+				return rel, nil, err
 			}
 		}
 	}
 
 	if !i.DisableHooks {
 		if err := i.cfg.execHook(rel, release.HookPostInstall, i.Timeout); err != nil {
-			return i.failRelease(rel, fmt.Errorf("failed post-install: %s", err))
+			rel, err := i.failRelease(rel, fmt.Errorf("failed post-install: %s", err))
+			return rel, nil, err
 		}
 	}
 
@@ -387,7 +454,7 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
 		i.cfg.Log("failed to record the release: %s", err)
 	}
 
-	return rel, nil
+	return rel, kubeResult, nil
 }
 
 func (i *Install) failRelease(rel *release.Release, err error) (*release.Release, error) {

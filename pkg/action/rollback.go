@@ -25,6 +25,7 @@ import (
 	"github.com/pkg/errors"
 
 	"helm.sh/helm/v3/pkg/chartutil"
+	"helm.sh/helm/v3/pkg/kube"
 	"helm.sh/helm/v3/pkg/release"
 	helmtime "helm.sh/helm/v3/pkg/time"
 )
@@ -45,6 +46,9 @@ type Rollback struct {
 	Force         bool // will (if true) force resource upgrade through uninstall/recreate if needed
 	CleanupOnFail bool
 	MaxHistory    int // MaxHistory limits the maximum number of revisions saved per release
+	// ServerDryRun specifies whether to make use of apiserver dry-run for kube api.
+	// If `true`, the upgrade is performed with apiserver dry-run enabled, without changing stored release meta.
+	ServerDryRun bool
 }
 
 // NewRollback creates a new Rollback object with the given configuration.
@@ -56,8 +60,22 @@ func NewRollback(cfg *Configuration) *Rollback {
 
 // Run executes 'helm rollback' against the given release.
 func (r *Rollback) Run(name string) error {
+	_, err := r.RunWithResult(name)
+	return err
+}
+
+// RunWithResult executes 'helm rollback' against the given release returning kube.Result as well.
+func (r *Rollback) RunWithResult(name string) (*kube.Result, error) {
+	if r.ServerDryRun {
+		dri, ok := r.cfg.KubeClient.(kube.ServerDryRunnableInterface)
+		if !ok {
+			return nil, errors.New("the kube client doesn't support server dry run")
+		}
+		r.cfg.KubeClient = dri.WithServerDryRun()
+	}
+
 	if err := r.cfg.KubeClient.IsReachable(); err != nil {
-		return err
+		return nil, err
 	}
 
 	r.cfg.Releases.MaxHistory = r.MaxHistory
@@ -65,28 +83,29 @@ func (r *Rollback) Run(name string) error {
 	r.cfg.Log("preparing rollback of %s", name)
 	currentRelease, targetRelease, err := r.prepareRollback(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if !r.DryRun {
+	if !r.DryRun && !r.ServerDryRun {
 		r.cfg.Log("creating rolled back release for %s", name)
 		if err := r.cfg.Releases.Create(targetRelease); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	r.cfg.Log("performing rollback of %s", name)
-	if _, err := r.performRollback(currentRelease, targetRelease); err != nil {
-		return err
+	_, kubeResult, err := r.performRollback(currentRelease, targetRelease)
+	if err != nil {
+		return nil, err
 	}
 
-	if !r.DryRun {
+	if !r.DryRun && !r.ServerDryRun {
 		r.cfg.Log("updating status for rolled back release for %s", name)
 		if err := r.cfg.Releases.Update(targetRelease); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return kubeResult, nil
 }
 
 // prepareRollback finds the previous release and prepares a new release object with
@@ -140,28 +159,30 @@ func (r *Rollback) prepareRollback(name string) (*release.Release, *release.Rele
 	return currentRelease, targetRelease, nil
 }
 
-func (r *Rollback) performRollback(currentRelease, targetRelease *release.Release) (*release.Release, error) {
+func (r *Rollback) performRollback(currentRelease, targetRelease *release.Release) (*release.Release, *kube.Result, error) {
 	if r.DryRun {
 		r.cfg.Log("dry run for %s", targetRelease.Name)
-		return targetRelease, nil
+		return targetRelease, nil, nil
 	}
 
 	current, err := r.cfg.KubeClient.Build(bytes.NewBufferString(currentRelease.Manifest), false)
 	if err != nil {
-		return targetRelease, errors.Wrap(err, "unable to build kubernetes objects from current release manifest")
+		return targetRelease, nil, errors.Wrap(err, "unable to build kubernetes objects from current release manifest")
 	}
 	target, err := r.cfg.KubeClient.Build(bytes.NewBufferString(targetRelease.Manifest), false)
 	if err != nil {
-		return targetRelease, errors.Wrap(err, "unable to build kubernetes objects from new release manifest")
+		return targetRelease, nil, errors.Wrap(err, "unable to build kubernetes objects from new release manifest")
 	}
 
 	// pre-rollback hooks
-	if !r.DisableHooks {
-		if err := r.cfg.execHook(targetRelease, release.HookPreRollback, r.Timeout); err != nil {
-			return targetRelease, err
+	if !r.ServerDryRun {
+		if !r.DisableHooks {
+			if err := r.cfg.execHook(targetRelease, release.HookPreRollback, r.Timeout); err != nil {
+				return targetRelease, nil, err
+			}
+		} else {
+			r.cfg.Log("rollback hooks disabled for %s", targetRelease.Name)
 		}
-	} else {
-		r.cfg.Log("rollback hooks disabled for %s", targetRelease.Name)
 	}
 
 	results, err := r.cfg.KubeClient.Update(current, target, r.Force)
@@ -172,21 +193,28 @@ func (r *Rollback) performRollback(currentRelease, targetRelease *release.Releas
 		currentRelease.Info.Status = release.StatusSuperseded
 		targetRelease.Info.Status = release.StatusFailed
 		targetRelease.Info.Description = msg
-		r.cfg.recordRelease(currentRelease)
-		r.cfg.recordRelease(targetRelease)
-		if r.CleanupOnFail {
-			r.cfg.Log("Cleanup on fail set, cleaning up %d resources", len(results.Created))
-			_, errs := r.cfg.KubeClient.Delete(results.Created)
-			if errs != nil {
-				var errorList []string
-				for _, e := range errs {
-					errorList = append(errorList, e.Error())
+		if !r.ServerDryRun {
+			r.cfg.recordRelease(currentRelease)
+			r.cfg.recordRelease(targetRelease)
+			if r.CleanupOnFail {
+				r.cfg.Log("Cleanup on fail set, cleaning up %d resources", len(results.Created))
+				if _, errs := r.cfg.KubeClient.Delete(results.Created); errs != nil {
+					var errorList []string
+					for _, e := range errs {
+						errorList = append(errorList, e.Error())
+					}
+					return targetRelease, nil, errors.Wrapf(fmt.Errorf("unable to cleanup resources: %s", strings.Join(errorList, ", ")), "an error occurred while cleaning up resources. original rollback error: %s", err)
 				}
-				return targetRelease, errors.Wrapf(fmt.Errorf("unable to cleanup resources: %s", strings.Join(errorList, ", ")), "an error occurred while cleaning up resources. original rollback error: %s", err)
+				r.cfg.Log("Resource cleanup complete")
 			}
-			r.cfg.Log("Resource cleanup complete")
 		}
-		return targetRelease, err
+		return targetRelease, results, err
+	}
+
+	// skip further operations if we're doing a server dry run
+	if r.ServerDryRun {
+		targetRelease.Info.Status = release.StatusDeployed
+		return targetRelease, results, nil
 	}
 
 	if r.Recreate {
@@ -205,14 +233,14 @@ func (r *Rollback) performRollback(currentRelease, targetRelease *release.Releas
 				targetRelease.SetStatus(release.StatusFailed, fmt.Sprintf("Release %q failed: %s", targetRelease.Name, err.Error()))
 				r.cfg.recordRelease(currentRelease)
 				r.cfg.recordRelease(targetRelease)
-				return targetRelease, errors.Wrapf(err, "release %s failed", targetRelease.Name)
+				return targetRelease, nil, errors.Wrapf(err, "release %s failed", targetRelease.Name)
 			}
 		} else {
 			if err := r.cfg.KubeClient.Wait(target, r.Timeout); err != nil {
 				targetRelease.SetStatus(release.StatusFailed, fmt.Sprintf("Release %q failed: %s", targetRelease.Name, err.Error()))
 				r.cfg.recordRelease(currentRelease)
 				r.cfg.recordRelease(targetRelease)
-				return targetRelease, errors.Wrapf(err, "release %s failed", targetRelease.Name)
+				return targetRelease, nil, errors.Wrapf(err, "release %s failed", targetRelease.Name)
 			}
 		}
 	}
@@ -220,13 +248,13 @@ func (r *Rollback) performRollback(currentRelease, targetRelease *release.Releas
 	// post-rollback hooks
 	if !r.DisableHooks {
 		if err := r.cfg.execHook(targetRelease, release.HookPostRollback, r.Timeout); err != nil {
-			return targetRelease, err
+			return targetRelease, nil, err
 		}
 	}
 
 	deployed, err := r.cfg.Releases.DeployedAll(currentRelease.Name)
 	if err != nil && !strings.Contains(err.Error(), "has no deployed releases") {
-		return nil, err
+		return nil, nil, err
 	}
 	// Supersede all previous deployments, see issue #2941.
 	for _, rel := range deployed {
@@ -237,5 +265,5 @@ func (r *Rollback) performRollback(currentRelease, targetRelease *release.Releas
 
 	targetRelease.Info.Status = release.StatusDeployed
 
-	return targetRelease, nil
+	return targetRelease, results, nil
 }

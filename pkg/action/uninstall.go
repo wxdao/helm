@@ -23,6 +23,7 @@ import (
 	"github.com/pkg/errors"
 
 	"helm.sh/helm/v3/pkg/chartutil"
+	"helm.sh/helm/v3/pkg/kube"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	helmtime "helm.sh/helm/v3/pkg/time"
@@ -39,6 +40,9 @@ type Uninstall struct {
 	KeepHistory  bool
 	Timeout      time.Duration
 	Description  string
+	// ServerDryRun specifies whether to make use of apiserver dry-run for kube api.
+	// If `true`, the upgrade is performed with apiserver dry-run enabled, without changing stored release meta.
+	ServerDryRun bool
 }
 
 // NewUninstall creates a new Uninstall object with the given configuration.
@@ -50,29 +54,43 @@ func NewUninstall(cfg *Configuration) *Uninstall {
 
 // Run uninstalls the given release.
 func (u *Uninstall) Run(name string) (*release.UninstallReleaseResponse, error) {
+	rel, _, err := u.RunWithResult(name)
+	return rel, err
+}
+
+// RunWithResult uninstalls the given release returning kube.Result as well.
+func (u *Uninstall) RunWithResult(name string) (*release.UninstallReleaseResponse, *kube.Result, error) {
+	if u.ServerDryRun {
+		dri, ok := u.cfg.KubeClient.(kube.ServerDryRunnableInterface)
+		if !ok {
+			return nil, nil, errors.New("the kube client doesn't support server dry run")
+		}
+		u.cfg.KubeClient = dri.WithServerDryRun()
+	}
+
 	if err := u.cfg.KubeClient.IsReachable(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if u.DryRun {
 		// In the dry run case, just see if the release exists
 		r, err := u.cfg.releaseContent(name, 0)
 		if err != nil {
-			return &release.UninstallReleaseResponse{}, err
+			return &release.UninstallReleaseResponse{}, nil, err
 		}
-		return &release.UninstallReleaseResponse{Release: r}, nil
+		return &release.UninstallReleaseResponse{Release: r}, nil, nil
 	}
 
 	if err := chartutil.ValidateReleaseName(name); err != nil {
-		return nil, errors.Errorf("uninstall: Release name is invalid: %s", name)
+		return nil, nil, errors.Errorf("uninstall: Release name is invalid: %s", name)
 	}
 
 	rels, err := u.cfg.Releases.History(name)
 	if err != nil {
-		return nil, errors.Wrapf(err, "uninstall: Release not loaded: %s", name)
+		return nil, nil, errors.Wrapf(err, "uninstall: Release not loaded: %s", name)
 	}
 	if len(rels) < 1 {
-		return nil, errMissingRelease
+		return nil, nil, errMissingRelease
 	}
 
 	releaseutil.SortByRevision(rels)
@@ -81,13 +99,13 @@ func (u *Uninstall) Run(name string) (*release.UninstallReleaseResponse, error) 
 	// TODO: Are there any cases where we want to force a delete even if it's
 	// already marked deleted?
 	if rel.Info.Status == release.StatusUninstalled {
-		if !u.KeepHistory {
+		if !u.KeepHistory && !u.ServerDryRun {
 			if err := u.purgeReleases(rels...); err != nil {
-				return nil, errors.Wrap(err, "uninstall: Failed to purge the release")
+				return nil, nil, errors.Wrap(err, "uninstall: Failed to purge the release")
 			}
-			return &release.UninstallReleaseResponse{Release: rel}, nil
+			return &release.UninstallReleaseResponse{Release: rel}, nil, nil
 		}
-		return nil, errors.Errorf("the release named %q is already deleted", name)
+		return nil, nil, errors.Errorf("the release named %q is already deleted", name)
 	}
 
 	u.cfg.Log("uninstall: Deleting %s", name)
@@ -96,26 +114,41 @@ func (u *Uninstall) Run(name string) (*release.UninstallReleaseResponse, error) 
 	rel.Info.Description = "Deletion in progress (or silently failed)"
 	res := &release.UninstallReleaseResponse{Release: rel}
 
-	if !u.DisableHooks {
-		if err := u.cfg.execHook(rel, release.HookPreDelete, u.Timeout); err != nil {
-			return res, err
+	if !u.ServerDryRun {
+		if !u.DisableHooks {
+			if err := u.cfg.execHook(rel, release.HookPreDelete, u.Timeout); err != nil {
+				return res, nil, err
+			}
+		} else {
+			u.cfg.Log("delete hooks disabled for %s", name)
 		}
-	} else {
-		u.cfg.Log("delete hooks disabled for %s", name)
+
+		// From here on out, the release is currently considered to be in StatusUninstalling
+		// state.
+		if err := u.cfg.Releases.Update(rel); err != nil {
+			u.cfg.Log("uninstall: Failed to store updated release: %s", err)
+		}
 	}
 
-	// From here on out, the release is currently considered to be in StatusUninstalling
-	// state.
-	if err := u.cfg.Releases.Update(rel); err != nil {
-		u.cfg.Log("uninstall: Failed to store updated release: %s", err)
-	}
-
-	kept, errs := u.deleteRelease(rel)
+	kept, kubeResult, errs := u.deleteRelease(rel)
 
 	if kept != "" {
 		kept = "These resources were kept due to the resource policy:\n" + kept
 	}
 	res.Info = kept
+
+	if u.ServerDryRun {
+		rel.Info.Status = release.StatusUninstalled
+		if len(u.Description) > 0 {
+			rel.Info.Description = u.Description
+		} else {
+			rel.Info.Description = "Server dry run complete"
+		}
+		if len(errs) > 0 {
+			return res, nil, errors.Errorf("uninstallation with server dry run completed with %d error(s): %s", len(errs), joinErrors(errs))
+		}
+		return res, kubeResult, nil
+	}
 
 	if !u.DisableHooks {
 		if err := u.cfg.execHook(rel, release.HookPostDelete, u.Timeout); err != nil {
@@ -139,10 +172,10 @@ func (u *Uninstall) Run(name string) (*release.UninstallReleaseResponse, error) 
 
 		// Return the errors that occurred while deleting the release, if any
 		if len(errs) > 0 {
-			return res, errors.Errorf("uninstallation completed with %d error(s): %s", len(errs), joinErrors(errs))
+			return res, nil, errors.Errorf("uninstallation completed with %d error(s): %s", len(errs), joinErrors(errs))
 		}
 
-		return res, nil
+		return res, nil, nil
 	}
 
 	if err := u.cfg.Releases.Update(rel); err != nil {
@@ -150,9 +183,9 @@ func (u *Uninstall) Run(name string) (*release.UninstallReleaseResponse, error) 
 	}
 
 	if len(errs) > 0 {
-		return res, errors.Errorf("uninstallation completed with %d error(s): %s", len(errs), joinErrors(errs))
+		return res, nil, errors.Errorf("uninstallation completed with %d error(s): %s", len(errs), joinErrors(errs))
 	}
-	return res, nil
+	return res, kubeResult, nil
 }
 
 func (u *Uninstall) purgeReleases(rels ...*release.Release) error {
@@ -173,11 +206,11 @@ func joinErrors(errs []error) string {
 }
 
 // deleteRelease deletes the release and returns manifests that were kept in the deletion process
-func (u *Uninstall) deleteRelease(rel *release.Release) (string, []error) {
+func (u *Uninstall) deleteRelease(rel *release.Release) (string, *kube.Result, []error) {
 	var errs []error
 	caps, err := u.cfg.getCapabilities()
 	if err != nil {
-		return rel.Manifest, []error{errors.Wrap(err, "could not get apiVersions from Kubernetes")}
+		return rel.Manifest, nil, []error{errors.Wrap(err, "could not get apiVersions from Kubernetes")}
 	}
 
 	manifests := releaseutil.SplitManifests(rel.Manifest)
@@ -187,7 +220,7 @@ func (u *Uninstall) deleteRelease(rel *release.Release) (string, []error) {
 		// FIXME: One way to delete at this point would be to try a label-based
 		// deletion. The problem with this is that we could get a false positive
 		// and delete something that was not legitimately part of this release.
-		return rel.Manifest, []error{errors.Wrap(err, "corrupted release record. You must manually delete the resources")}
+		return rel.Manifest, nil, []error{errors.Wrap(err, "corrupted release record. You must manually delete the resources")}
 	}
 
 	filesToKeep, filesToDelete := filterManifestsToKeep(files)
@@ -203,10 +236,11 @@ func (u *Uninstall) deleteRelease(rel *release.Release) (string, []error) {
 
 	resources, err := u.cfg.KubeClient.Build(strings.NewReader(builder.String()), false)
 	if err != nil {
-		return "", []error{errors.Wrap(err, "unable to build kubernetes objects for delete")}
+		return "", nil, []error{errors.Wrap(err, "unable to build kubernetes objects for delete")}
 	}
+	kubeResult := &kube.Result{}
 	if len(resources) > 0 {
-		_, errs = u.cfg.KubeClient.Delete(resources)
+		kubeResult, errs = u.cfg.KubeClient.Delete(resources)
 	}
-	return kept, errs
+	return kept, kubeResult, errs
 }

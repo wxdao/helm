@@ -68,6 +68,8 @@ type EnvSettings struct {
 	PluginsDirectory string
 	// MaxHistory is the max release history maintained.
 	MaxHistory int
+	// ExternalDiff is the diff command prefix to use when diffing resources.
+	ExternalDiff string
 }
 
 func New() *EnvSettings {
@@ -84,6 +86,7 @@ func New() *EnvSettings {
 		RegistryConfig:   envOr("HELM_REGISTRY_CONFIG", helmpath.ConfigPath("registry.json")),
 		RepositoryConfig: envOr("HELM_REPOSITORY_CONFIG", helmpath.ConfigPath("repositories.yaml")),
 		RepositoryCache:  envOr("HELM_REPOSITORY_CACHE", helmpath.CachePath("repository")),
+		ExternalDiff:     envOr("HELM_EXTERNAL_DIFF", "diff -u -N"),
 	}
 	env.Debug, _ = strconv.ParseBool(os.Getenv("HELM_DEBUG"))
 

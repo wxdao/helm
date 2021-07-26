@@ -105,3 +105,10 @@ func (f *FailingKubeClient) WaitAndGetCompletedPodPhase(s string, d time.Duratio
 	}
 	return f.PrintingKubeClient.WaitAndGetCompletedPodPhase(s, d)
 }
+
+// WithServerDryRun implements KubeClient WithServerDryRun.
+func (f *FailingKubeClient) WithServerDryRun() kube.Interface {
+	nf := *f
+	nf.PrintingKubeClient.DryRun = true
+	return &nf
+}

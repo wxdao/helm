@@ -19,11 +19,14 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"helm.sh/helm/v3/cmd/helm/require"
+	"helm.sh/helm/v3/internal/diffutil"
 	"helm.sh/helm/v3/pkg/action"
 )
 
@@ -39,6 +42,7 @@ uninstalling them.
 
 func newUninstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	client := action.NewUninstall(cfg)
+	var diff bool
 
 	cmd := &cobra.Command{
 		Use:        "uninstall RELEASE_NAME [...]",
@@ -51,23 +55,50 @@ func newUninstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			return compListReleases(toComplete, args, cfg)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			client.ServerDryRun = diff
+
+			var differ *diffutil.Differ
+			if diff {
+				var err error
+				differ, err = diffutil.NewDiffer()
+				if err != nil {
+					return errors.Wrap(err, "failed to create a differ")
+				}
+				defer differ.Cleanup()
+			}
+
 			for i := 0; i < len(args); i++ {
 
-				res, err := client.Run(args[i])
+				res, result, err := client.RunWithResult(args[i])
 				if err != nil {
 					return err
 				}
+
+				if diff {
+					diffutil.WriteKubeResult(differ, result)
+					continue
+				}
+
 				if res != nil && res.Info != "" {
 					fmt.Fprintln(out, res.Info)
 				}
 
 				fmt.Fprintf(out, "release \"%s\" uninstalled\n", args[i])
 			}
+
+			if diff {
+				if err := differ.Run(settings.ExternalDiff, cmd.OutOrStdout(), cmd.OutOrStderr()); err != nil {
+					// not to print anything ourself here since it'll break diff output format
+					os.Exit(1)
+				}
+			}
+
 			return nil
 		},
 	}
 
 	f := cmd.Flags()
+	f.BoolVar(&diff, "diff", false, "Server dry-run the action and diff resources. HELM_EXTERNAL_DIFF environment variable can be used to select your own diff command, default being '"+settings.ExternalDiff+"'")
 	f.BoolVar(&client.DryRun, "dry-run", false, "simulate a uninstall")
 	f.BoolVar(&client.DisableHooks, "no-hooks", false, "prevent hooks from running during uninstallation")
 	f.BoolVar(&client.KeepHistory, "keep-history", false, "remove all associated resources and mark the release as deleted, but retain the release history")

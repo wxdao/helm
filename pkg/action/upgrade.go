@@ -100,6 +100,9 @@ type Upgrade struct {
 	DisableOpenAPIValidation bool
 	// Get missing dependencies
 	DependencyUpdate bool
+	// ServerDryRun specifies whether to make use of apiserver dry-run for kube api.
+	// If `true`, the upgrade is performed with apiserver dry-run enabled, without changing stored release meta.
+	ServerDryRun bool
 }
 
 // NewUpgrade creates a new Upgrade object with the given configuration.
@@ -111,8 +114,23 @@ func NewUpgrade(cfg *Configuration) *Upgrade {
 
 // Run executes the upgrade on the given release.
 func (u *Upgrade) Run(name string, chart *chart.Chart, vals map[string]interface{}) (*release.Release, error) {
+	rel, _, err := u.RunWithResult(name, chart, vals)
+
+	return rel, err
+}
+
+// RunWithResult executes the upgrade on the given release returning kube.Result as well.
+func (u *Upgrade) RunWithResult(name string, chart *chart.Chart, vals map[string]interface{}) (*release.Release, *kube.Result, error) {
+	if u.ServerDryRun {
+		dri, ok := u.cfg.KubeClient.(kube.ServerDryRunnableInterface)
+		if !ok {
+			return nil, nil, errors.New("the kube client doesn't support server dry run")
+		}
+		u.cfg.KubeClient = dri.WithServerDryRun()
+	}
+
 	if err := u.cfg.KubeClient.IsReachable(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Make sure if Atomic is set, that wait is set as well. This makes it so
@@ -120,30 +138,30 @@ func (u *Upgrade) Run(name string, chart *chart.Chart, vals map[string]interface
 	u.Wait = u.Wait || u.Atomic
 
 	if err := chartutil.ValidateReleaseName(name); err != nil {
-		return nil, errors.Errorf("release name is invalid: %s", name)
+		return nil, nil, errors.Errorf("release name is invalid: %s", name)
 	}
 	u.cfg.Log("preparing upgrade for %s", name)
 	currentRelease, upgradedRelease, err := u.prepareUpgrade(name, chart, vals)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	u.cfg.Releases.MaxHistory = u.MaxHistory
 
 	u.cfg.Log("performing update for %s", name)
-	res, err := u.performUpgrade(currentRelease, upgradedRelease)
+	res, kubeResult, err := u.performUpgrade(currentRelease, upgradedRelease)
 	if err != nil {
-		return res, err
+		return res, nil, err
 	}
 
-	if !u.DryRun {
+	if !u.DryRun && !u.ServerDryRun {
 		u.cfg.Log("updating status for upgraded release for %s", name)
 		if err := u.cfg.Releases.Update(upgradedRelease); err != nil {
-			return res, err
+			return res, nil, err
 		}
 	}
 
-	return res, nil
+	return res, kubeResult, nil
 }
 
 // prepareUpgrade builds an upgraded release for an upgrade operation.
@@ -243,27 +261,27 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chart.Chart, vals map[strin
 	return currentRelease, upgradedRelease, err
 }
 
-func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Release) (*release.Release, error) {
+func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Release) (*release.Release, *kube.Result, error) {
 	current, err := u.cfg.KubeClient.Build(bytes.NewBufferString(originalRelease.Manifest), false)
 	if err != nil {
 		// Checking for removed Kubernetes API error so can provide a more informative error message to the user
 		// Ref: https://github.com/helm/helm/issues/7219
 		if strings.Contains(err.Error(), "unable to recognize \"\": no matches for kind") {
-			return upgradedRelease, errors.Wrap(err, "current release manifest contains removed kubernetes api(s) for this "+
+			return upgradedRelease, nil, errors.Wrap(err, "current release manifest contains removed kubernetes api(s) for this "+
 				"kubernetes version and it is therefore unable to build the kubernetes "+
 				"objects for performing the diff. error from kubernetes")
 		}
-		return upgradedRelease, errors.Wrap(err, "unable to build kubernetes objects from current release manifest")
+		return upgradedRelease, nil, errors.Wrap(err, "unable to build kubernetes objects from current release manifest")
 	}
 	target, err := u.cfg.KubeClient.Build(bytes.NewBufferString(upgradedRelease.Manifest), !u.DisableOpenAPIValidation)
 	if err != nil {
-		return upgradedRelease, errors.Wrap(err, "unable to build kubernetes objects from new release manifest")
+		return upgradedRelease, nil, errors.Wrap(err, "unable to build kubernetes objects from new release manifest")
 	}
 
 	// It is safe to use force only on target because these are resources currently rendered by the chart.
 	err = target.Visit(setMetadataVisitor(upgradedRelease.Name, upgradedRelease.Namespace, true))
 	if err != nil {
-		return upgradedRelease, err
+		return upgradedRelease, nil, err
 	}
 
 	// Do a basic diff using gvk + name to figure out what new resources are being created so we can validate they don't already exist
@@ -281,7 +299,7 @@ func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Relea
 
 	toBeUpdated, err := existingResourceConflict(toBeCreated, upgradedRelease.Name, upgradedRelease.Namespace)
 	if err != nil {
-		return nil, errors.Wrap(err, "rendered manifests contain a resource that already exists. Unable to continue with update")
+		return nil, nil, errors.Wrap(err, "rendered manifests contain a resource that already exists. Unable to continue with update")
 	}
 
 	toBeUpdated.Visit(func(r *resource.Info, err error) error {
@@ -299,27 +317,43 @@ func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Relea
 		} else {
 			upgradedRelease.Info.Description = "Dry run complete"
 		}
-		return upgradedRelease, nil
+		return upgradedRelease, nil, nil
 	}
 
-	u.cfg.Log("creating upgraded release for %s", upgradedRelease.Name)
-	if err := u.cfg.Releases.Create(upgradedRelease); err != nil {
-		return nil, err
-	}
-
-	// pre-upgrade hooks
-	if !u.DisableHooks {
-		if err := u.cfg.execHook(upgradedRelease, release.HookPreUpgrade, u.Timeout); err != nil {
-			return u.failRelease(upgradedRelease, kube.ResourceList{}, fmt.Errorf("pre-upgrade hooks failed: %s", err))
+	if !u.ServerDryRun {
+		u.cfg.Log("creating upgraded release for %s", upgradedRelease.Name)
+		if err := u.cfg.Releases.Create(upgradedRelease); err != nil {
+			return nil, nil, err
 		}
-	} else {
-		u.cfg.Log("upgrade hooks disabled for %s", upgradedRelease.Name)
+
+		// pre-upgrade hooks
+		if !u.DisableHooks {
+			if err := u.cfg.execHook(upgradedRelease, release.HookPreUpgrade, u.Timeout); err != nil {
+				rel, err := u.failRelease(upgradedRelease, kube.ResourceList{}, fmt.Errorf("pre-upgrade hooks failed: %s", err))
+				return rel, nil, err
+			}
+		} else {
+			u.cfg.Log("upgrade hooks disabled for %s", upgradedRelease.Name)
+		}
 	}
 
 	results, err := u.cfg.KubeClient.Update(current, target, u.Force)
 	if err != nil {
+		if u.ServerDryRun {
+			upgradedRelease.SetStatus(release.StatusFailed, fmt.Sprintf("Upgrade %q failed: %s", upgradedRelease.Name, err))
+			return upgradedRelease, nil, err
+		}
 		u.cfg.recordRelease(originalRelease)
-		return u.failRelease(upgradedRelease, results.Created, err)
+		rel, err := u.failRelease(upgradedRelease, results.Created, err)
+		return rel, nil, err
+	}
+	if u.ServerDryRun {
+		if len(u.Description) > 0 {
+			upgradedRelease.Info.Description = u.Description
+		} else {
+			upgradedRelease.Info.Description = "Server dry run complete"
+		}
+		return upgradedRelease, results, nil
 	}
 
 	if u.Recreate {
@@ -336,12 +370,14 @@ func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Relea
 		if u.WaitForJobs {
 			if err := u.cfg.KubeClient.WaitWithJobs(target, u.Timeout); err != nil {
 				u.cfg.recordRelease(originalRelease)
-				return u.failRelease(upgradedRelease, results.Created, err)
+				rel, err := u.failRelease(upgradedRelease, results.Created, err)
+				return rel, nil, err
 			}
 		} else {
 			if err := u.cfg.KubeClient.Wait(target, u.Timeout); err != nil {
 				u.cfg.recordRelease(originalRelease)
-				return u.failRelease(upgradedRelease, results.Created, err)
+				rel, err := u.failRelease(upgradedRelease, results.Created, err)
+				return rel, nil, err
 			}
 		}
 	}
@@ -349,7 +385,8 @@ func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Relea
 	// post-upgrade hooks
 	if !u.DisableHooks {
 		if err := u.cfg.execHook(upgradedRelease, release.HookPostUpgrade, u.Timeout); err != nil {
-			return u.failRelease(upgradedRelease, results.Created, fmt.Errorf("post-upgrade hooks failed: %s", err))
+			rel, err := u.failRelease(upgradedRelease, results.Created, fmt.Errorf("post-upgrade hooks failed: %s", err))
+			return rel, nil, err
 		}
 	}
 
@@ -363,7 +400,7 @@ func (u *Upgrade) performUpgrade(originalRelease, upgradedRelease *release.Relea
 		upgradedRelease.Info.Description = "Upgrade complete"
 	}
 
-	return upgradedRelease, nil
+	return upgradedRelease, results, nil
 }
 
 func (u *Upgrade) failRelease(rel *release.Release, created kube.ResourceList, err error) (*release.Release, error) {

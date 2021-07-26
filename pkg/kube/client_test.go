@@ -178,6 +178,12 @@ func TestUpdate(t *testing.T) {
 	if len(result.Updated) != 2 {
 		t.Errorf("expected 2 resource updated, got %d", len(result.Updated))
 	}
+	if len(result.LiveBeforeUpdate) != 2 {
+		t.Errorf("expected 2 live objects returned, got %d", len(result.LiveBeforeUpdate))
+	}
+	if result.LiveBeforeUpdate[result.Updated[0]] == nil || result.LiveBeforeUpdate[result.Updated[1]] == nil {
+		t.Errorf("expected 2 live objects related to updated infos")
+	}
 	if len(result.Deleted) != 1 {
 		t.Errorf("expected 1 resource deleted, got %d", len(result.Deleted))
 	}

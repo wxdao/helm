@@ -19,6 +19,7 @@ package main
 import (
 	"io"
 	"log"
+	"os"
 	"time"
 
 	"github.com/pkg/errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"helm.sh/helm/v3/cmd/helm/require"
+	"helm.sh/helm/v3/internal/diffutil"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
@@ -33,6 +35,7 @@ import (
 	"helm.sh/helm/v3/pkg/cli/values"
 	"helm.sh/helm/v3/pkg/downloader"
 	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/kube"
 	"helm.sh/helm/v3/pkg/release"
 )
 
@@ -107,6 +110,7 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	client := action.NewInstall(cfg)
 	valueOpts := &values.Options{}
 	var outfmt output.Format
+	var diff bool
 
 	cmd := &cobra.Command{
 		Use:   "install [NAME] [CHART]",
@@ -116,25 +120,47 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			return compInstall(args, toComplete, client)
 		},
-		RunE: func(_ *cobra.Command, args []string) error {
-			rel, err := runInstall(args, client, valueOpts, out)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client.ServerDryRun = diff
+
+			rel, result, err := runInstall(args, client, valueOpts, out)
 			if err != nil {
 				return err
+			}
+
+			if diff {
+				differ, err := diffutil.NewDiffer()
+				if err != nil {
+					return errors.Wrap(err, "failed to create a differ")
+				}
+				defer differ.Cleanup()
+
+				diffutil.WriteKubeResult(differ, result)
+
+				if err := differ.Run(settings.ExternalDiff, cmd.OutOrStdout(), cmd.OutOrStderr()); err != nil {
+					// not to print anything ourself here since it'll break diff output format
+					os.Exit(1)
+				}
+
+				return nil
 			}
 
 			return outfmt.Write(out, &statusPrinter{rel, settings.Debug, false})
 		},
 	}
 
-	addInstallFlags(cmd, cmd.Flags(), client, valueOpts)
+	addInstallFlags(cmd, cmd.Flags(), client, valueOpts, &diff)
 	bindOutputFlag(cmd, &outfmt)
 	bindPostRenderFlag(cmd, &client.PostRenderer)
 
 	return cmd
 }
 
-func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Install, valueOpts *values.Options) {
+func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Install, valueOpts *values.Options, diff *bool) {
 	f.BoolVar(&client.CreateNamespace, "create-namespace", false, "create the release namespace if not present")
+	if diff != nil {
+		f.BoolVar(diff, "diff", false, "Server dry-run the action and diff resources. HELM_EXTERNAL_DIFF environment variable can be used to select your own diff command, default being '"+settings.ExternalDiff+"'")
+	}
 	f.BoolVar(&client.DryRun, "dry-run", false, "simulate an install")
 	f.BoolVar(&client.DisableHooks, "no-hooks", false, "prevent hooks from running during install")
 	f.BoolVar(&client.Replace, "replace", false, "re-use the given name, only if that name is a deleted release which remains in the history. This is unsafe in production")
@@ -169,7 +195,7 @@ func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Instal
 	}
 }
 
-func runInstall(args []string, client *action.Install, valueOpts *values.Options, out io.Writer) (*release.Release, error) {
+func runInstall(args []string, client *action.Install, valueOpts *values.Options, out io.Writer) (*release.Release, *kube.Result, error) {
 	debug("Original chart version: %q", client.Version)
 	if client.Version == "" && client.Devel {
 		debug("setting version to >0.0.0-0")
@@ -178,13 +204,13 @@ func runInstall(args []string, client *action.Install, valueOpts *values.Options
 
 	name, chart, err := client.NameAndChart(args)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client.ReleaseName = name
 
 	cp, err := client.ChartPathOptions.LocateChart(chart, settings)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	debug("CHART PATH: %s\n", cp)
@@ -192,17 +218,17 @@ func runInstall(args []string, client *action.Install, valueOpts *values.Options
 	p := getter.All(settings)
 	vals, err := valueOpts.MergeValues(p)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Check chart dependencies to make sure all are present in /charts
 	chartRequested, err := loader.Load(cp)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := checkIfInstallable(chartRequested); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if chartRequested.Metadata.Deprecated {
@@ -226,20 +252,20 @@ func runInstall(args []string, client *action.Install, valueOpts *values.Options
 					Debug:            settings.Debug,
 				}
 				if err := man.Update(); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				// Reload the chart with the updated Chart.lock file.
 				if chartRequested, err = loader.Load(cp); err != nil {
-					return nil, errors.Wrap(err, "failed reloading chart after repo update")
+					return nil, nil, errors.Wrap(err, "failed reloading chart after repo update")
 				}
 			} else {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
 
 	client.Namespace = settings.Namespace()
-	return client.Run(chartRequested, vals)
+	return client.RunWithResult(chartRequested, vals)
 }
 
 // checkIfInstallable validates if a chart can be installed

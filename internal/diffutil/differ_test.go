@@ -14,21 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package kube
+package diffutil
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/cli-runtime/pkg/resource"
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-// Result contains the information of created, updated, and deleted resources
-// for various kube API calls along with helper methods for using those
-// resources
-type Result struct {
-	Created          ResourceList
-	Updated          ResourceList
-	LiveBeforeUpdate map[*resource.Info]runtime.Object
-	Deleted          ResourceList
+func TestDiffer(t *testing.T) {
+	is := assert.New(t)
+
+	differ, err := NewDiffer()
+	is.NoError(err)
+	defer differ.Cleanup()
+
+	oldDir, newDir := differ.subdirs()
+
+	differ.WriteOld("foo", []byte("bar"))
+	differ.WriteNew("foo", []byte("bar"))
+
+	is.NoError(differ.Run("diff", nil, nil))
+
+	is.NoError(differ.Cleanup())
+	is.False(checkDirectoryExists(oldDir))
+	is.False(checkDirectoryExists(newDir))
 }
 
-// If needed, we can add methods to the Result type for things like diffing
+func checkDirectoryExists(dir string) bool {
+	_, err := os.Stat(dir)
+	return err == nil
+}

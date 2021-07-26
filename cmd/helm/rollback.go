@@ -19,12 +19,15 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"helm.sh/helm/v3/cmd/helm/require"
+	"helm.sh/helm/v3/internal/diffutil"
 	"helm.sh/helm/v3/pkg/action"
 )
 
@@ -40,6 +43,7 @@ To see revision numbers, run 'helm history RELEASE'.
 
 func newRollbackCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	client := action.NewRollback(cfg)
+	var diff bool
 
 	cmd := &cobra.Command{
 		Use:   "rollback <RELEASE> [REVISION]",
@@ -58,6 +62,8 @@ func newRollbackCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			client.ServerDryRun = diff
+
 			if len(args) > 1 {
 				ver, err := strconv.Atoi(args[1])
 				if err != nil {
@@ -66,8 +72,26 @@ func newRollbackCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 				client.Version = ver
 			}
 
-			if err := client.Run(args[0]); err != nil {
+			result, err := client.RunWithResult(args[0])
+			if err != nil {
 				return err
+			}
+
+			if diff {
+				differ, err := diffutil.NewDiffer()
+				if err != nil {
+					return errors.Wrap(err, "failed to create a differ")
+				}
+				defer differ.Cleanup()
+
+				diffutil.WriteKubeResult(differ, result)
+
+				if err := differ.Run(settings.ExternalDiff, cmd.OutOrStdout(), cmd.OutOrStderr()); err != nil {
+					// not to print anything ourself here since it'll break diff output format
+					os.Exit(1)
+				}
+
+				return nil
 			}
 
 			fmt.Fprintf(out, "Rollback was a success! Happy Helming!\n")
@@ -76,6 +100,7 @@ func newRollbackCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	}
 
 	f := cmd.Flags()
+	f.BoolVar(&diff, "diff", false, "Server dry-run the action and diff resources. HELM_EXTERNAL_DIFF environment variable can be used to select your own diff command, default being '"+settings.ExternalDiff+"'")
 	f.BoolVar(&client.DryRun, "dry-run", false, "simulate a rollback")
 	f.BoolVar(&client.Recreate, "recreate-pods", false, "performs pods restart for the resource if applicable")
 	f.BoolVar(&client.Force, "force", false, "force resource update through delete/recreate if needed")

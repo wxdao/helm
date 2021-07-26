@@ -20,12 +20,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"helm.sh/helm/v3/cmd/helm/require"
+	"helm.sh/helm/v3/internal/diffutil"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli/output"
@@ -67,6 +69,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	valueOpts := &values.Options{}
 	var outfmt output.Format
 	var createNamespace bool
+	var diff bool
 
 	cmd := &cobra.Command{
 		Use:   "upgrade [RELEASE] [CHART]",
@@ -84,6 +87,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client.Namespace = settings.Namespace()
+			client.ServerDryRun = diff
 
 			// Fixes #7002 - Support reading values from STDIN for `upgrade` command
 			// Must load values AFTER determining if we have to call install so that values loaded from stdin are are not read twice
@@ -112,11 +116,30 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 					instClient.DisableOpenAPIValidation = client.DisableOpenAPIValidation
 					instClient.SubNotes = client.SubNotes
 					instClient.Description = client.Description
+					instClient.ServerDryRun = diff
 
-					rel, err := runInstall(args, instClient, valueOpts, out)
+					rel, result, err := runInstall(args, instClient, valueOpts, out)
 					if err != nil {
 						return err
 					}
+
+					if diff {
+						differ, err := diffutil.NewDiffer()
+						if err != nil {
+							return errors.Wrap(err, "failed to create a differ")
+						}
+						defer differ.Cleanup()
+
+						diffutil.WriteKubeResult(differ, result)
+
+						if err := differ.Run(settings.ExternalDiff, cmd.OutOrStdout(), cmd.OutOrStderr()); err != nil {
+							// not to print anything ourself here since it'll break diff output format
+							os.Exit(1)
+						}
+
+						return nil
+					}
+
 					return outfmt.Write(out, &statusPrinter{rel, settings.Debug, false})
 				} else if err != nil {
 					return err
@@ -174,9 +197,26 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 				warning("This chart is deprecated")
 			}
 
-			rel, err := client.Run(args[0], ch, vals)
+			rel, result, err := client.RunWithResult(args[0], ch, vals)
 			if err != nil {
 				return errors.Wrap(err, "UPGRADE FAILED")
+			}
+
+			if diff {
+				differ, err := diffutil.NewDiffer()
+				if err != nil {
+					return errors.Wrap(err, "failed to create a differ")
+				}
+				defer differ.Cleanup()
+
+				diffutil.WriteKubeResult(differ, result)
+
+				if err := differ.Run(settings.ExternalDiff, cmd.OutOrStdout(), cmd.OutOrStderr()); err != nil {
+					// not to print anything ourself here since it'll break diff output format
+					os.Exit(1)
+				}
+
+				return nil
 			}
 
 			if outfmt == output.Table {
@@ -189,6 +229,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 
 	f := cmd.Flags()
 	f.BoolVar(&createNamespace, "create-namespace", false, "if --install is set, create the release namespace if not present")
+	f.BoolVar(&diff, "diff", false, "Server dry-run the action and diff resources. HELM_EXTERNAL_DIFF environment variable can be used to select your own diff command, default being '"+settings.ExternalDiff+"'")
 	f.BoolVarP(&client.Install, "install", "i", false, "if a release by this name doesn't already exist, run an install")
 	f.BoolVar(&client.Devel, "devel", false, "use development versions, too. Equivalent to version '>0.0.0-0'. If --version is set, this is ignored")
 	f.BoolVar(&client.DryRun, "dry-run", false, "simulate an upgrade")
