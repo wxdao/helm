@@ -175,7 +175,7 @@ func (u *Uninstall) RunWithResult(name string) (*release.UninstallReleaseRespons
 			return res, nil, errors.Errorf("uninstallation completed with %d error(s): %s", len(errs), joinErrors(errs))
 		}
 
-		return res, nil, nil
+		return res, kubeResult, nil
 	}
 
 	if err := u.cfg.Releases.Update(rel); err != nil {
